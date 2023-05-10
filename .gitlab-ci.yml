@@ -1,0 +1,335 @@
+include:
+  - project: invafresh/infra/templates/pipelines
+    ref: 1.1.3
+    file: terraform/gitlab.terraform-job-templates.yml
+  - project: invafresh/infra/templates/pipelines
+    ref: 1.1.3
+    file: terraform/gitlab.terraform-az-inv-dev-vars.template.yml
+  - project: invafresh/infra/templates/pipelines
+    ref: 1.1.3
+    file: terraform/gitlab.terraform-az-inv-qa-vars.template.yml
+  - project: invafresh/infra/templates/pipelines
+    ref: 1.1.3
+    file: terraform/gitlab.terraform-az-inv-prod-vars.template.yml
+
+image:
+  name: registry.gitlab.com/invafresh/infra/docker/terraform-azure:1.1.0
+
+cache:
+  key: '${PREFIX}-${ENVIRONMENT_CODE}'
+  paths:
+    - .terraform/
+    - .terraform.lock.hcl
+
+workflow:
+  rules:
+    - if: $CI_MERGE_REQUEST_ID
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+variables:
+  DEPLOY_ALL_ENV_FLAG:
+    value: 'true'
+    description: 'If set to true, the pipeline will generate jobs to deploy the terraform stack to all environments. If set to false, will trigger deploy_single_env job only and deploy environment defined with $PREFIX and $ENVIRONMENT_CODE'
+  SKIP_ENVIRONMENT_DEPLOYMENT_REGEX:
+    value: ''
+    description: 'Input regex to skip specific $PREFIX-$ENVIRONMENT_CODE combinations from being deployed, used if $DEPLOY_ALL_ENV_FLAG = true'
+  PERISCOPE_VM_IMAGE_VERSION:
+    value: '5.8.172'
+    description: 'VM image version built by Packer for App server, MQ and Web VMs to be deployed. Leave empty if VM image version must not be updated. Empty by default.'
+  # default environment prefix and code used during MR and after MR merge. This variable is also used by Packer pipeline to trigger single environment deployment. The variable does not take precedence over each deploy_* jobs except for terraform_plan, tflint and deploy_single_env jobs
+  # Warning! if the variable is input in the UI or through API trigger and DEPLOY_ALL_ENV_FLAG is set to true, all deploy_* jobs will deploy the same environment!
+  # the reason is gitlab CI variable input through UI or API trigger will take precedence over any variable set inside this file
+  # resource: https://docs.gitlab.com/ee/ci/variables/#cicd-variable-precedence
+  PREFIX: 'glb'
+  ENVIRONMENT_CODE: 'int'
+  # change the flag to true and input $PREFIX + $ENVIRONMENT_CODE to trigger the terraform_destroy job
+  DESTROY_FLAG: 'false'
+  TF_PLAN_OUT_FILENAME: 'plan.out'
+  ARM_TENANT_ID: '${INVAFRESH_AZ_TENANT_ID}'
+  TF_VAR_datadog_api_key: '${DATADOG_API_KEY}'
+  TF_VAR_datadog_app_key: '${DATADOG_APP_KEY}'
+  TF_VAR_pagerduty_token: '${PAGERDUTY_TOKEN}'
+  TF_VAR_pagerduty_token: "${PAGERDUTY_TOKEN}"
+  SEND_DEPLOY_EVENTS_TO_DATADOG_FLAG: 'true' # feeature flag for sending deployment events to DataDog Events api
+  TF_VAR_vm_zone: '${AZURE_VM_ZONE}' # for DR scenario's, we can change the zone the individual vm's are in. Value is set in the gitlab project under CI/CD
+  TF_VAR_launchdarkly_access_token: '${launchdarkly_access_token}' #found in the infra group ci/cd variables
+
+stages:
+  - CI
+  - deploy # used by the deploy_single_env job only
+  - CD_Integration
+  - CD_Dev_QA
+  - CD_UAT
+  - CD_Prod
+  - post_deploy
+  - destroy # used by the terraform_destroy job only
+
+## job templates
+
+.custom_echo_input_variables:
+  script:
+    - 'echo "DEPLOY_ALL_ENV_FLAG": $DEPLOY_ALL_ENV_FLAG'
+    - 'echo "SKIP_ENVIRONMENT_DEPLOYMENT_REGEX": $SKIP_ENVIRONMENT_DEPLOYMENT_REGEX'
+    - 'echo "PREFIX: $PREFIX"'
+    - 'echo "ENVIRONMENT_CODE: $ENVIRONMENT_CODE"'
+    - 'echo "PERISCOPE_VM_IMAGE_VERSION: $PERISCOPE_VM_IMAGE_VERSION"'
+
+# this template sets up app_image_version, mq_image_version and web_image_version tf variables
+# the variables will be set on the current periscope_vm_image_version output if $PERISCOPE_VM_IMAGE_VERSION pipeline variable is empty
+# else it will use $PERISCOPE_VM_IMAGE_VERSION pipeline variable value
+.custom_set_tfvar_periscope_vm_image_version:
+  script:
+    # If PERISCOPE_VM_IMAGE_VERSION variable is empty, retrieve periscope_vm_image_version terraform output instead and use it as input
+    - |
+      if [ -z "$PERISCOPE_VM_IMAGE_VERSION" ]
+      then
+        echo "PERISCOPE_VM_IMAGE_VERSION env var is empty, retrieving current terraform output periscope_vm_image_version"
+        periscope_vm_image_version=$(terraform output -raw periscope_vm_image_version)
+        echo "Current Periscope VMs/VMSS use image version $periscope_vm_image_version, no update will be applied."
+        export TF_VAR_app_image_version=$periscope_vm_image_version
+        export TF_VAR_mq_image_version=$periscope_vm_image_version
+        export TF_VAR_web_image_version=$periscope_vm_image_version
+      else
+        echo "Periscope VMs/VMSS will be updated to image version $PERISCOPE_VM_IMAGE_VERSION"
+        export TF_VAR_app_image_version=$PERISCOPE_VM_IMAGE_VERSION
+        export TF_VAR_mq_image_version=$PERISCOPE_VM_IMAGE_VERSION
+        export TF_VAR_web_image_version=$PERISCOPE_VM_IMAGE_VERSION
+      fi
+
+# the scripts below generates network.auto.tfvars with CIDR for all subnets
+.custom_retrieve_network_config:
+  script:
+    - 'pwsh scripts/az_connect_shared_services.ps1'
+    - 'pwsh scripts/ipam.ps1 ${PREFIX} ${ENVIRONMENT_CODE}'
+# this script retrieves configuration from tf-periscope-infra-config repository for the current $PREFIX
+.custom_retrieve_tf_periscope_infra_config:
+  script:
+    - 'git clone https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.com/invafresh/infra/tf-periscope-infra-config.git'
+    - 'cd tf-periscope-infra-config'
+    - 'git checkout ${CI_MERGE_REQUEST_SOURCE_BRANCH_NAME} || git checkout main'
+    - 'cp commons.tfvars ${CI_PROJECT_DIR}'
+    - 'cp -r ${PREFIX}/* ${CI_PROJECT_DIR}'
+    - 'cd ${CI_PROJECT_DIR}'
+
+# this terraform init template will set up the terraform backend with Azure invatrontfstatess storage account
+# it will also re-use the custom_set_tfvar_periscope_vm_image_version and custom_download_tfvars script templates
+.custom_terraform_init:
+  before_script:
+    - !reference [.custom_echo_input_variables, script]
+    - >
+      terraform init \
+        -reconfigure \
+        -upgrade \
+        -backend-config="access_key=${TERRAFORM_STATE_STORAGE_ACCOUNT_ACCESS_KEY}" \
+        -backend-config="key=${ENVIRONMENT_CODE}${PREFIX}-tf-state-file"
+    - !reference [.custom_set_tfvar_periscope_vm_image_version, script]
+    - !reference [.custom_retrieve_network_config, script]
+    - !reference [.custom_retrieve_tf_periscope_infra_config, script]
+
+# template for terraform destroy step, uses custom_terraform_init template, .terraform:destroy script and also deletes the environment confluence page
+.custom_terraform_destroy:
+  extends:
+    - .custom_terraform_init # this template overrides .terraform:init template's before_script, called before
+  needs: ['terraform_plan']
+  resource_group: '${PREFIX}-${ENVIRONMENT_CODE}'
+  environment:
+    name: '${PREFIX}-${ENVIRONMENT_CODE}'
+    action: stop
+  rules:
+    - if: '$ENVIRONMENT_CODE =~ /^dev|int|dmo/ && $DESTROY_FLAG == "true"'
+      variables: !reference [.azure_inv_sandbox_dev_sp, variables]
+      when: manual
+    - if: '$ENVIRONMENT_CODE =~ /^qa|qam|qab/ && $DESTROY_FLAG == "true"'
+      variables: !reference [.azure_inv_qa_sp, variables]
+      when: manual
+    - if: '$ENVIRONMENT_CODE =~ /^uat|prd|dbg/ && $DESTROY_FLAG == "true"'
+      variables: !reference [.azure_inv_prod_sp, variables]
+      when: manual
+  script:
+    - !reference [.terraform:destroy, script]
+    - 'pwsh scripts/remove_confluence_page.ps1'
+
+# this job template is meant to be used to deploy any environments, it will run only manually
+# the template executes the following steps:
+# - runs commands from custom_terraform_init template
+# - terraform plan
+# - create datadog downtime for the environment
+# - terraform apply
+# - trigger esha pipeline if is_esha_deployed tf output = true and $PERISCOPE_VM_IMAGE_VERSION not empty
+# - update environment confluence page
+# - run datadog synthetic tests
+# - delete datadog downtime
+.custom_deploy_stack:
+  extends:
+    - .custom_terraform_init
+  dependencies: [] # prevents the job from downloading artifacts from previous job!!
+  rules:
+    - if: '$DESTROY_FLAG == "true"'
+      when: never
+    - if: '"$PREFIX-$ENVIRONMENT_CODE" =~ $SKIP_ENVIRONMENT_DEPLOYMENT_REGEX'
+      when: never
+    - if: '$DEPLOY_ALL_ENV_FLAG == "true" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $ENVIRONMENT_CODE =~ /^dev|int|dmo/'
+      variables: !reference [.azure_inv_sandbox_dev_sp, variables]
+      when: manual
+    - if: '$DEPLOY_ALL_ENV_FLAG == "true" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $ENVIRONMENT_CODE =~ /^qa|qam|qab/'
+      variables: !reference [.azure_inv_qa_sp, variables]
+      when: manual
+    - if: '$DEPLOY_ALL_ENV_FLAG == "true" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $ENVIRONMENT_CODE =~ /^uat|prd|dbg/'
+      variables: !reference [.azure_inv_prod_sp, variables]
+      when: manual
+  variables:
+    TF_PLAN_ARGS: '-var-file=commons.tfvars -var-file=network.auto.tfvars -var-file=${PREFIX}-${ENVIRONMENT_CODE}.tfvars'
+  resource_group: '${PREFIX}-${ENVIRONMENT_CODE}'
+  environment:
+    name: '${PREFIX}-${ENVIRONMENT_CODE}'
+    action: start
+  script:
+    - !reference [.terraform:plan, script]
+    - 'pwsh scripts/datadog_event_post.ps1 start' # POST event to Datadog that deployment is starting
+    - 'pwsh scripts/datadog_teams_start_downtime.ps1'
+    - 'terraform apply ${TF_PLAN_OUT_FILENAME}'
+    - 'terraform output -json > output.json'
+    - 'pwsh scripts/trigger_esha_pipeline.ps1' # if is_esha_deployed tf output = true and $PERISCOPE_VM_IMAGE_VERSION not empty, trigger the ansible-periscope-esha gitlab pipeline
+    - 'pwsh scripts/inv_dev_temp_ssh_nsg_rule.ps1' # for INFRA-188
+    #- 'pwsh scripts/qam_qa_temp_esha_nsg_rule.ps1' # for INFRA-344
+    - 'pwsh scripts/confluence_page_update.ps1'
+    - 'scripts/datadog_synthetic_check_ci.sh' # requires terraform-azure docker image >=v1.1.0
+    - 'pwsh scripts/datadog_teams_stop_downtime.ps1'
+  after_script:
+    - echo "Job Status = $CI_JOB_STATUS"
+    - 'pwsh scripts/datadog_event_post.ps1 $CI_JOB_STATUS' # POST event to Datadog $CI_JOB_STATUS can be success/failed/canceled
+    - 'pwsh scripts/trigger_gitlab_datadog_pipeline.ps1' # POST event to Datadog $CI_JOB_STATUS can be success/failed/canceled
+  artifacts:
+    name: '$CI_JOB_NAME-$CI_COMMIT_REF_NAME'
+    paths:
+      - ./${TF_PLAN_OUT_FILENAME}
+      - '${PREFIX}-${ENVIRONMENT_CODE}.tfvars'
+      - commons.tfvars
+      - 'ATJobs/'
+      - 'Web/'
+      - 'network.auto.tfvars'
+      - 'output.json'
+    reports:
+      terraform: ./${TF_PLAN_OUT_FILENAME}.json
+
+# pipeline jobs
+
+terraform_fmt:
+  stage: CI
+  extends: .terraform:fmt
+
+# TODO: Fix this image
+# tflint:
+#   stage: CI
+#   # dependency on terraform_plan to retrieve *.tfvars from the job artifacts
+#   needs: ['terraform_plan']
+#   extends:
+#     - .terraform:tflint
+#   variables:
+#     TF_LINT_ARGS: '--var-file=commons.tfvars --var-file=network.auto.tfvars --var-file=${PREFIX}-${ENVIRONMENT_CODE}.tfvars --loglevel=info'
+
+checkov:
+  stage: CI
+  extends: .terraform:checkov
+  allow_failure: true
+
+# the tf plan also includes terraform validate, runs plan on glb-int by default
+terraform_plan:
+  stage: CI
+  extends: .custom_terraform_init
+  rules:
+    - if: '$ENVIRONMENT_CODE =~ /^dev|int|dmo/'
+      variables: !reference [.azure_inv_sandbox_dev_sp, variables]
+      when: on_success
+    - if: '$ENVIRONMENT_CODE =~ /^qa|qam|qab/'
+      variables: !reference [.azure_inv_qa_sp, variables]
+      when: on_success
+    - if: '$ENVIRONMENT_CODE =~ /^uat|prd|dbg/'
+      variables: !reference [.azure_inv_prod_sp, variables]
+      when: on_success
+  variables:
+    TF_PLAN_ARGS: '-var-file=commons.tfvars -var-file=network.auto.tfvars -var-file=${PREFIX}-${ENVIRONMENT_CODE}.tfvars'
+  resource_group: '${PREFIX}-${ENVIRONMENT_CODE}'
+  script:
+    - !reference [.terraform:plan, script]
+  artifacts:
+    name: '$CI_JOB_NAME-$CI_COMMIT_REF_NAME'
+    paths:
+      - ./${TF_PLAN_OUT_FILENAME}
+      - '${PREFIX}-${ENVIRONMENT_CODE}.tfvars'
+      - commons.tfvars
+      - 'ATJobs/'
+      - 'Web/'
+      - 'network.auto.tfvars'
+    reports:
+      terraform: ./${TF_PLAN_OUT_FILENAME}.json
+
+terraform_plan_small:
+  stage: CI
+  extends: .custom_terraform_init
+  rules:
+    - if: '$ENVIRONMENT_CODE =~ /^dev|int|dmo/'
+      variables: !reference [.azure_inv_sandbox_dev_sp, variables]
+      when: on_success
+    - if: '$ENVIRONMENT_CODE =~ /^qa|qam|qab/'
+      variables: !reference [.azure_inv_qa_sp, variables]
+      when: on_success
+    - if: '$ENVIRONMENT_CODE =~ /^uat|prd|dbg/'
+      variables: !reference [.azure_inv_prod_sp, variables]
+      when: on_success
+  variables:
+    PREFIX: 'sml'
+    ENVIRONMENT_CODE: 'dev'
+    TF_PLAN_ARGS: '-var-file=commons.tfvars -var-file=network.auto.tfvars -var-file=${PREFIX}-${ENVIRONMENT_CODE}.tfvars'
+  resource_group: '${PREFIX}-${ENVIRONMENT_CODE}'
+  script:
+    - !reference [.terraform:plan, script]
+  artifacts:
+    name: '$CI_JOB_NAME-$CI_COMMIT_REF_NAME'
+    paths:
+      - ./${TF_PLAN_OUT_FILENAME}
+      - '${PREFIX}-${ENVIRONMENT_CODE}.tfvars'
+      - commons.tfvars
+      - 'ATJobs/'
+      - 'Web/'
+      - 'network.auto.tfvars'
+    reports:
+      terraform: ./${TF_PLAN_OUT_FILENAME}.json
+
+# to enable this job, the caller has to provide the following variables manually from the web UI:
+# - PREFIX, ex. glb
+# - ENVIRONMENT_CODE, ex. int
+# - DESTROY_FLAG = "true"
+# The job will require a manual input before running
+terraform_destroy:
+  stage: destroy
+  extends: .custom_terraform_destroy
+
+## environment specific deployment jobs, extending .custom_deploy_stack template
+
+# this job is meant to be used as a standalone post packer build
+deploy_single_env:
+  stage: deploy
+  extends:
+    - .custom_deploy_stack
+  # override .custom_deploy_stack rules to make the job run only if $DEPLOY_ALL_ENV_FLAG == "false"
+  rules:
+    - if: '$DESTROY_FLAG == "true"'
+      when: never
+    - if: '$DEPLOY_ALL_ENV_FLAG == "false" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $ENVIRONMENT_CODE =~ /^dev|int|dmo/'
+      variables: !reference [.azure_inv_sandbox_dev_sp, variables]
+      when: on_success
+    - if: '$DEPLOY_ALL_ENV_FLAG == "false" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $ENVIRONMENT_CODE =~ /^qa|qam|qab/'
+      variables: !reference [.azure_inv_qa_sp, variables]
+      when: on_success
+    - if: '$DEPLOY_ALL_ENV_FLAG == "false" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $ENVIRONMENT_CODE =~ /^uat|prd|dbg/'
+      variables: !reference [.azure_inv_prod_sp, variables]
+      when: on_success
+
+deploy_glb_int:
+  stage: CD_Integration
+  extends:
+    - .custom_deploy_stack
+  variables:
+    PREFIX: glb
+    ENVIRONMENT_CODE: int
